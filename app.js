@@ -26,6 +26,14 @@
   let planageoFeatures = [];
   let selectedResultButton = null;
   let activeTitleFeature = null;
+  let activeTitleAttrs = null;
+  let holderRun = 0; // identifica a execução atual (cancela execuções antigas)
+  let planageoBboxes = null;
+  const MAX_HOLDER_TITLES = 3000;
+  const HOLDER_PAGE = 500;
+  const HOLDER_LABEL = "Mostrar todos os títulos com mesma titularidade";
+  const holderButton = $("holderButton");
+  const holderHint = $("holderHint");
   const seriesData = {}; // key -> { features: [...], bboxes: [...] }
   let seriesLoadInfo = "";
 
@@ -108,6 +116,17 @@
       paint: { "line-color": groupColor, "line-width": 1.5 }
     });
 
+    // Todos os títulos do mesmo titular
+    map.addSource("holder-titles", { type: "geojson", data: EMPTY_FC() });
+    map.addLayer({
+      id: "holder-fill", type: "fill", source: "holder-titles",
+      paint: { "fill-color": "#ef4444", "fill-opacity": 0.1 }
+    });
+    map.addLayer({
+      id: "holder-line", type: "line", source: "holder-titles",
+      paint: { "line-color": "#d72e2e", "line-width": 1.2, "line-dasharray": [3, 2] }
+    });
+
     // Destaques: projetos Planageo e séries que intersectam o título
     map.addSource("selected-projects", { type: "geojson", data: EMPTY_FC() });
     map.addLayer({
@@ -143,6 +162,7 @@
 
     // Clique: mostra todos os polígonos visíveis sob o cursor
     const clickable = [
+      "holder-fill",
       "planageo-fill",
       ...SERIES.map(s => `${s.key}-fill`)
     ];
@@ -152,13 +172,13 @@
       const items = [];
       const seen = new Set();
       for (const h of hits) {
-        const isPlanageo = h.layer.id === "planageo-fill";
-        const id = isPlanageo ? `p-${h.properties.objectid}` : h.properties._sid;
+        const kind = h.layer.id.replace("-fill", "");
+        const id = kind === "planageo" ? `p-${h.properties.objectid}`
+          : kind === "holder" ? `h-${h.properties.OBJECTID}`
+          : h.properties._sid;
         if (seen.has(id)) continue;
         seen.add(id);
-        items.push(isPlanageo
-          ? { kind: "planageo", props: h.properties }
-          : { kind: h.layer.id.replace("-fill", ""), props: h.properties });
+        items.push({ kind, props: h.properties });
       }
       showClickDetails(items);
     });
@@ -454,6 +474,9 @@
     if (selectedResultButton) selectedResultButton.classList.remove("active");
     selectedResultButton = button;
     button.classList.add("active");
+    clearHolder();
+    activeTitleAttrs = null;
+    updateHolderButton();
     setStatus(`Obtendo geometria do processo ${attrs.PROCESSO || attrs.DSProcesso || attrs.OBJECTID}…`);
     try {
       const geometryData = await postQuery(ANM_QUERY, {
@@ -491,6 +514,8 @@
         map.getSource(`selected-${s.key}`).setData({ type: "FeatureCollection", features: seriesMatches[s.key] });
       }
 
+      activeTitleAttrs = attrs;
+      updateHolderButton();
       showTitleDetails(attrs, matches, seriesMatches);
       fitGeometry(titleFeature.geometry);
       const serieTotal = SERIES.reduce((n, s) => n + seriesMatches[s.key].length, 0);
@@ -567,6 +592,8 @@
     for (const item of items) {
       if (item.kind === "planageo") {
         detailsEl.append(projectCard(item.props));
+      } else if (item.kind === "holder") {
+        detailsEl.append(titleCard(item.props));
       } else {
         const s = SERIES.find(x => x.key === item.kind);
         detailsEl.append(serieCard(s, item.props));
@@ -574,7 +601,7 @@
     }
   }
 
-  function projectCard(p) {
+  function projectCard(p, extra) {
     const card = document.createElement("div");
     card.className = "project-link";
     const name = p.projeto || `Projeto ${p.num_projeto || p.objectid || ""}`;
@@ -584,13 +611,14 @@
     if (p.area != null) card.append(textEl("p", `Área informada pelo SGB: ${formatArea(p.area)} km²`));
     if (p.km_estimado != null) card.append(textEl("p", `Extensão estimada: ${Number(p.km_estimado).toLocaleString("pt-BR", { maximumFractionDigits: 0 })} km`));
     if (p.status) card.append(textEl("p", `Status: ${p.status}`));
+    if (extra) card.append(textEl("p", extra));
     return card;
   }
 
   // Os atributos das séries não são conhecidos de antemão: mostra o nome (se achar)
   // e os demais atributos preenchidos.
   const TITLE_KEYS = ["projeto", "nome_projeto", "nome", "name", "titulo", "title", "levantamento", "id"];
-  function serieCard(serie, props) {
+  function serieCard(serie, props, extra) {
     const card = document.createElement("div");
     card.className = "project-link";
     const keys = Object.keys(props).filter(k => !k.startsWith("_"));
@@ -606,12 +634,180 @@
       card.append(textEl("p", `${k}: ${v}`, "kv"));
       shown++;
     }
+    if (extra) card.append(textEl("p", extra));
+    return card;
+  }
+
+  /* ---------------------------------------------------------------
+   * Todos os títulos do mesmo titular
+   * ------------------------------------------------------------- */
+  const sleep0 = () => new Promise(resolve => setTimeout(resolve, 0));
+  const procLabel = (p) => p.DSProcesso || p.PROCESSO || `ObjectID ${p.OBJECTID}`;
+
+  function clearHolder() {
+    holderRun++; // cancela qualquer carga em andamento
+    const src = map.getSource("holder-titles");
+    if (src) src.setData(EMPTY_FC());
+  }
+
+  function updateHolderButton() {
+    const name = activeTitleAttrs && activeTitleAttrs.NOME ? String(activeTitleAttrs.NOME).trim() : "";
+    holderButton.disabled = !name;
+    holderButton.textContent = HOLDER_LABEL;
+    holderHint.textContent = name
+      ? `Titular do título selecionado: ${name}`
+      : activeTitleAttrs
+        ? "O título selecionado não tem titular informado."
+        : "Selecione um título para ativar.";
+  }
+
+  async function fetchHolderTitles(holder, run) {
+    const where = `UPPER(NOME) = UPPER('${escapeSql(holder)}')`;
+    const countData = await postQuery(ANM_QUERY, { where, returnCountOnly: "true", f: "json" });
+    if (run !== holderRun) return null;
+    const total = Number(countData.count || 0);
+    const limit = Math.min(total, MAX_HOLDER_TITLES);
+    const titles = [];
+    for (let offset = 0; offset < limit; offset += HOLDER_PAGE) {
+      setStatus(`Carregando títulos de ${holder}: ${titles.length} de ${limit}…`);
+      const data = await postQuery(ANM_QUERY, {
+        where,
+        outFields: ANM_FIELDS,
+        returnGeometry: "true",
+        outSR: "4326",
+        geometryPrecision: "6",
+        orderByFields: "OBJECTID ASC",
+        resultOffset: String(offset),
+        resultRecordCount: String(Math.min(HOLDER_PAGE, limit - offset)),
+        f: "geojson"
+      });
+      if (run !== holderRun) return null;
+      titles.push(...(data.features || []).filter(f => f.geometry));
+    }
+    return { titles, total };
+  }
+
+  // Cruza cada alvo (Planageo ou série) com todos os títulos; descarta por bbox antes de testar.
+  async function crossHolder(titles, titleBoxes, targets, targetBoxes, run, label) {
+    const out = [];
+    for (let i = 0; i < targets.length; i++) {
+      const b = targetBoxes[i];
+      const hits = [];
+      for (let j = 0; j < titles.length; j++) {
+        const tb = titleBoxes[j];
+        if (b[0] > tb[2] || b[2] < tb[0] || b[1] > tb[3] || b[3] < tb[1]) continue;
+        try {
+          if (turf.booleanIntersects(titles[j], targets[i])) hits.push(titles[j].properties);
+        } catch (e) { /* geometria inválida: ignora */ }
+      }
+      if (hits.length) out.push({ feature: targets[i], hits });
+      if (i % 25 === 24) {
+        setStatus(`Cruzando ${label}: ${i + 1} de ${targets.length}…`);
+        await sleep0();
+        if (run !== holderRun) return null;
+      }
+    }
+    out.sort((x, y) => y.hits.length - x.hits.length);
+    return out;
+  }
+
+  async function showHolderTitles() {
+    if (!activeTitleAttrs) return;
+    const holder = String(activeTitleAttrs.NOME || "").trim();
+    if (!holder) return;
+    const run = ++holderRun;
+    holderButton.disabled = true;
+    holderButton.textContent = "Carregando títulos…";
+    try {
+      const fetched = await fetchHolderTitles(holder, run);
+      if (!fetched) return;
+      const { titles, total } = fetched;
+      if (!titles.length) throw new Error("A ANM não retornou títulos para este titular.");
+      map.getSource("holder-titles").setData({ type: "FeatureCollection", features: titles });
+
+      const titleBoxes = titles.map(t => turf.bbox(t));
+      if (!planageoBboxes || planageoBboxes.length !== planageoFeatures.length) {
+        planageoBboxes = planageoFeatures.map(f => turf.bbox(f));
+      }
+
+      const planageoRes = await crossHolder(titles, titleBoxes, planageoFeatures, planageoBboxes, run, "Planageo");
+      if (!planageoRes) return;
+      const seriesRes = {};
+      for (const s of SERIES) {
+        const d = seriesData[s.key] || { features: [], bboxes: [] };
+        const r = await crossHolder(titles, titleBoxes, d.features, d.bboxes, run, s.label);
+        if (!r) return;
+        seriesRes[s.key] = r;
+      }
+
+      // Destaques no mapa
+      map.getSource("selected-projects").setData({
+        type: "FeatureCollection", features: planageoRes.map(r => r.feature)
+      });
+      for (const s of SERIES) {
+        map.getSource(`selected-${s.key}`).setData({
+          type: "FeatureCollection", features: seriesRes[s.key].map(r => r.feature)
+        });
+      }
+
+      showHolderDetails(holder, titles, total, planageoRes, seriesRes);
+      const b = turf.bbox({ type: "FeatureCollection", features: titles });
+      map.fitBounds([[b[0], b[1]], [b[2], b[3]]], { padding: 60, maxZoom: 11, duration: 700 });
+
+      const serieTotal = SERIES.reduce((n, s) => n + seriesRes[s.key].length, 0);
+      setStatus(
+        `${titles.length} título(s) de ${holder}` +
+        (total > titles.length ? ` (limitado a ${MAX_HOLDER_TITLES} de ${total.toLocaleString("pt-BR")})` : "") +
+        `. Interseção com ${planageoRes.length} projeto(s) Planageo e ${serieTotal} polígono(s) das séries.`,
+        total > titles.length
+      );
+    } catch (error) {
+      setStatus(`Não foi possível carregar os títulos do titular: ${error.message}`, true);
+    } finally {
+      if (run === holderRun) updateHolderButton();
+    }
+  }
+
+  function hitsLine(hits) {
+    const names = hits.slice(0, 5).map(procLabel).join(", ");
+    return `Títulos do titular intersectados: ${hits.length} — ${names}${hits.length > 5 ? `, +${hits.length - 5}` : ""}`;
+  }
+
+  function showHolderDetails(holder, titles, total, planageoRes, seriesRes) {
+    detailsEl.replaceChildren();
+    const area = titles.reduce((sum, t) => sum + (Number(t.properties.AREA_HA) || 0), 0);
+    const dl = document.createElement("dl");
+    dl.append(textEl("dt", "Titular"), textEl("dd", holder));
+    dl.append(textEl("dt", "Títulos no mapa"), textEl("dd", titles.length.toLocaleString("pt-BR")));
+    if (total > titles.length) dl.append(textEl("dt", "Total na ANM"), textEl("dd", total.toLocaleString("pt-BR")));
+    dl.append(textEl("dt", "Área somada (ha)"), textEl("dd", formatArea(area)));
+    detailsEl.append(dl);
+
+    detailsEl.append(textEl("h3", `Planageo — interseções: ${planageoRes.length}`, "subhead"));
+    if (!planageoRes.length) detailsEl.append(textEl("p", "Nenhum polígono Planageo intersectou os títulos deste titular.", "muted"));
+    for (const r of planageoRes) detailsEl.append(projectCard(r.feature.properties, hitsLine(r.hits)));
+
+    for (const s of SERIES) {
+      const list = seriesRes[s.key] || [];
+      detailsEl.append(textEl("h3", `${s.label} — interseções: ${list.length}`, "subhead"));
+      if (!list.length) detailsEl.append(textEl("p", `Nenhum polígono da ${s.label} intersectou os títulos deste titular.`, "muted"));
+      for (const r of list) detailsEl.append(serieCard(s, r.feature.properties, hitsLine(r.hits)));
+    }
+  }
+
+  function titleCard(p) {
+    const card = document.createElement("div");
+    card.className = "project-link";
+    card.append(textEl("strong", `${procLabel(p)} — ${p.NOME || "Titular não informado"}`));
+    card.append(textEl("p", `${p.SUBS || "Substância não informada"} · ${p.FASE || "Fase não informada"} · ${p.UF || "UF não informada"}`));
+    card.append(textEl("p", `Área: ${formatArea(p.AREA_HA)} ha`));
     return card;
   }
 
   /* ---------------------------------------------------------------
    * Eventos e inicialização
    * ------------------------------------------------------------- */
+  holderButton.addEventListener("click", showHolderTitles);
   $("searchButton").addEventListener("click", searchTitles);
   $("searchInput").addEventListener("keydown", (event) => {
     if (event.key === "Enter") searchTitles();
